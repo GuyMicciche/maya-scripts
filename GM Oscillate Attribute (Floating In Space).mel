@@ -1,0 +1,8 @@
+int $frame = `currentTime -q`;
+
+float $amplitude = 35.0; // Max and min degrees (starts at 0 degrees) to float in space
+float $frequency = 120.0; // Loop duration (starts at frame 0) to float in space
+float $phase = $frame % $frequency; // Calculate the phase
+float $angle = $amplitude * (sin(2 * 3.14159 * $phase / $frequency) + 1) - $amplitude;
+
+Pro_6_1_XTR_2_Glass.rotateY = $angle;
