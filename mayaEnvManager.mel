@@ -1,0 +1,120 @@
+/*
+ * mayaEnvManager.mel
+ * 
+ * DESCRIPTION:
+ * A Maya MEL utility script for displaying and managing environment path variables.
+ * Formats Maya environment paths into readable, indexed lists for easy debugging
+ * and troubleshooting. Helps identify missing paths, duplicate entries, and 
+ * path configuration issues.
+ * 
+ * FUNCTIONS:
+ * - displayPathVariable(string $varName) : Formats and displays any environment variable
+ * - showPaths()                          : Displays all common Maya path variables  
+ * - showPath(string $varName)           : Displays specific variable
+ * - addPath(string $varName, string $newPath) : Adds new path to existing variable
+ * - pathUtils()                          : Shows usage instructions
+ * 
+ * VARIABLES DISPLAYED:
+ * - MAYA_PLUG_IN_PATH  : Plugin directories Maya searches
+ * - MAYA_SCRIPT_PATH   : MEL script directories
+ * - PYTHONPATH         : Python script directories  
+ * - MAYA_MODULE_PATH   : Module directories
+ * - MAYA_SHELF_PATH    : Custom shelf directories
+ * - XBMLANGPATH        : Icon/UI resource directories
+ * 
+ * USAGE:
+ * 1. Source the script: source "pathManager.mel";
+ * 2. Run individual functions or execute the script directly
+ * 3. Use showPaths() to see all variables at once
+ * 4. Use showPath("VARIABLE_NAME") for specific variables
+ * 
+ * PLATFORM SUPPORT:
+ * - Automatically detects Windows (semicolon separator) vs Mac/Linux (colon separator)
+ * - Cross-platform compatible environment variable handling
+ * 
+ * OUTPUT FORMAT:
+ * === VARIABLE_NAME ===
+ *   [0] /path/to/first/directory
+ *   [1] /path/to/second/directory
+ *   [2] /path/to/third/directory
+ * 
+ * AUTHOR: Guy Micciche
+ * VERSION: 1.0
+ * DATE: September 2025
+ * MAYA VERSION: Compatible with Maya 2022+
+ */
+
+// Function to display any path variable formatted
+proc displayPathVariable(string $varName) {
+    string $allparts[];
+    string $separator = (`about -nt`) ? ";" : ":";
+    string $pathValue = `getenv $varName`;
+    
+    if ($pathValue == "") {
+        print($varName + " is not set or empty\n\n");
+        return;
+    }
+    
+    tokenize($pathValue, $separator, $allparts);
+    
+    print("=== " + $varName + " ===\n");
+    int $i;
+    for ($i = 0; $i < size($allparts); $i++) {
+        print("  [" + $i + "] " + $allparts[$i] + "\n");
+    }
+    print("\n");
+}
+
+// Display all common Maya path variables
+global proc showPaths() {
+    string $pathVars[] = {
+        "MAYA_PLUG_IN_PATH",
+        "MAYA_SCRIPT_PATH", 
+        "PYTHONPATH",
+        "MAYA_MODULE_PATH",
+        "MAYA_SHELF_PATH",
+        "XBMLANGPATH"
+    };
+    
+    print("\n=== MAYA PATH VARIABLES ===\n\n");
+    for ($var in $pathVars) {
+        displayPathVariable($var);
+    }
+}
+
+// Display specific path variable
+global proc showPath(string $varName) {
+    displayPathVariable($varName);
+}
+
+// Add new path to existing environment variable
+global proc addPath(string $varName, string $newPath) {
+    string $currentPath = `getenv $varName`;
+    string $separator = (`about -nt`) ? ";" : ":";
+    string $updatedPath = $newPath + $separator + $currentPath;
+    putenv $varName $updatedPath;
+    print("Added " + $newPath + " to " + $varName + "\n");
+}
+
+// Show usage instructions
+global proc pathUtils() {
+    print("\n=== MAYA PATH UTILITIES ===\n");
+    print("Usage:\n");
+    print("  showPaths() - Display all path variables\n");
+    print("  showPath(\"VAR_NAME\") - Display specific variable\n");
+    print("  addPath(\"VAR_NAME\", \"new/path\") - Add path to variable\n\n");
+    print("Examples:\n");
+    print("  showPath(\"MAYA_PLUG_IN_PATH\");\n");
+    print("  addPath(\"MAYA_SCRIPT_PATH\", \"C:/my/scripts\");\n\n");
+}
+
+// Initialize utility functions
+pathUtils();
+
+// Auto-execute: Display all common Maya path variables when script is sourced
+displayPathVariable("MAYA_PLUG_IN_PATH");
+displayPathVariable("MAYA_SCRIPT_PATH");
+displayPathVariable("PYTHONPATH");
+displayPathVariable("MAYA_MODULE_PATH");
+displayPathVariable("MAYA_SHELF_PATH");
+displayPathVariable("XBMLANGPATH");
