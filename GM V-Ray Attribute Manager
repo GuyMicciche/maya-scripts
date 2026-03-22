@@ -366,7 +366,7 @@ QLineEdit#searchField {
     selection-background-color: #0d7377;
 }
 QLineEdit#searchField:focus {
-    border-color: #0d7377;
+    border-color: #2857af;
 }
 
 /* Node count badge */
@@ -471,19 +471,6 @@ class VRayAttributeManager(QtWidgets.QWidget):
         mode_lay.addWidget(self._btn_transform)
         toolbar.addWidget(mode_frame)
 
-        # Search bar
-        search_row = QtWidgets.QHBoxLayout()
-        search_row.setSpacing(6)
-
-        self._search = QtWidgets.QLineEdit()
-        self._search.setObjectName("searchField")
-        self._search.setPlaceholderText("  Filter attributes...")
-        self._search.textChanged.connect(self._on_search_changed)
-        self._search.setClearButtonEnabled(True)
-        search_row.addWidget(self._search)
-
-        toolbar.addLayout(search_row)
-
         # Info / status bar
         self._info_frame = QtWidgets.QFrame()
         self._info_frame.setObjectName("infoBar")
@@ -501,6 +488,19 @@ class VRayAttributeManager(QtWidgets.QWidget):
         info_lay.addWidget(self._node_badge)
 
         toolbar.addWidget(self._info_frame)
+        
+        # Search bar
+        search_row = QtWidgets.QHBoxLayout()
+        search_row.setSpacing(6)
+
+        self._search = QtWidgets.QLineEdit()
+        self._search.setObjectName("searchField")
+        self._search.setPlaceholderText("  Filter attributes...")
+        self._search.textChanged.connect(self._on_search_changed)
+        self._search.setClearButtonEnabled(True)
+        search_row.addWidget(self._search)
+
+        toolbar.addLayout(search_row)      
 
         root.addLayout(toolbar)
 
