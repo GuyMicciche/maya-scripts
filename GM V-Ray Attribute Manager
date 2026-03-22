@@ -1,0 +1,800 @@
+"""
+V-Ray Attribute Manager
+Version: 2.0.0
+Author: Guy Micciche
+Year: 2025
+
+A Qt-based Maya tool for managing V-Ray extra attributes.
+Uses Maya API 2.0 callbacks instead of scriptJobs for selection tracking.
+
+Usage:
+    import vray_attribute_manager
+    vray_attribute_manager.show()
+"""
+
+import json
+import os
+from collections import OrderedDict
+from functools import partial
+
+import maya.cmds as cmds
+import maya.api.OpenMaya as om2
+from maya import OpenMayaUI as omui
+
+from PySide6 import QtWidgets, QtCore, QtGui
+
+try:
+    from shiboken2 import wrapInstance
+except ImportError:
+    from shiboken6 import wrapInstance
+
+
+# ---------------------------------------------------------------------------
+# V-Ray attribute registry
+# ---------------------------------------------------------------------------
+# Hard-coded is the most reliable approach — V-Ray has no public discovery API.
+# Keep this in an external JSON file for easy per-version updates.
+
+_VRAY_ATTRS = OrderedDict([
+    # Materials
+    ("Material ID",                         ("vray_material_id",              "vrayColorId")),
+    ("V-Ray material override",             ("vray_specific_mtl",             "vrayEnableAllOverrides")),
+    ("Closed Volume Shading",               ("vray_closed_volume",            "vrayClosedVolume")),
+    ("Light Path Expressions label",        ("vray_lpe_label",                "vrayLPELabel")),
+    # Mesh / Geometry
+    ("Subdivision",                         ("vray_subdivision",              "vraySubdivEnable")),
+    ("Subdivision and Displacement Quality",("vray_subquality",               "vrayOverrideGlobalSubQual")),
+    ("Displacement control",                ("vray_displacement",             "vrayDisplacementNone")),
+    ("Round edges",                         ("vray_roundedges",               "vrayRoundEdges")),
+    ("User attributes",                     ("vray_user_attributes",          "vrayUserAttributes")),
+    ("Object ID",                           ("vray_objectID",                 "vrayObjectID")),
+    ("Fog fade out radius",                 ("vray_fogFadeOut",               "vrayFogFadeOut")),
+    ("Phoenix Object Properties",           ("vray_phoenix_object",           "vrayPhoenixObjVoxels")),
+    # NurbsCurve
+    ("Renderable",                          ("vray_nurbscurve_renderable",    "vrayNurbsCurveRenderable")),
+    # Transform
+    ("Skip Rendering",                      ("vray_skip_export",              "vraySkipExport")),
+    # Camera
+    ("Physical Camera",                     ("vray_cameraPhysical",           "vrayCameraPhysicalOn")),
+    ("Camera Settings",                     ("vray_cameraOverrides",          "vrayCameraOverridesOn")),
+    ("Dome Camera",                         ("vray_cameraDome",               "vrayCameraDomeOn")),
+    ("Stereoscopic camera",                 ("vray_cameraStereoscopic",       "vrayCameraStereoscopicOn")),
+    # File / Texture
+    ("Texture input gamma",                 ("vray_file_gamma",               "vrayFileGammaEnable")),
+    ("Allow negative colors",               ("vray_file_allow_neg_colors",    "vrayFileAllowNegColors")),
+    ("Image file list (IFL)",               ("vray_file_ifl",                 "vrayFileIFLStartFrame")),
+    ("Texture filter",                      ("vray_texture_filter",           "vrayOverrideTextureFilter")),
+    ("Texture Filter Blur",                 ("vray_texture_filter_blur",      "vrayTextureFilterBlur")),
+    ("Ignore Data Window",                  ("vray_ignore_data_window",       "vrayIgnoreDataWindow")),
+    ("Override Maya-style Alpha Detection", ("vray_use_maya_alpha_detection", "vrayMayaAlphaDetection")),
+    # Placement
+    ("2D Placement Options",                ("vray_2d_placement_options",     "vrayUVSetName")),
+    # SamplerInfo
+    ("Additional outputs",                  ("vray_samplerinfo_extra_tex",    "vrayNormalObj")),
+    # Lights
+    ("Light Attributes (Point)",            ("vray_pointLight",               "vrayPhotonSubdivs")),
+    ("Light Attributes (Direct)",           ("vray_directlight",              "vrayPhotonSubdivs")),
+    ("Light Attributes (Ambient)",          ("vray_light",                    "vrayPhotonSubdivs")),
+    ("Light Attributes (Area)",             ("vray_arealight",                "vrayPhotonSubdivs")),
+    # Other
+    ("Local ray server",                    ("vray_localrayserver",           "vrayLocalRayserver")),
+])
+
+_VRAY_ATTRS_BY_TYPE = {
+    "kMesh":                ["vray_subdivision", "vray_subquality", "vray_displacement", "vray_opensubdiv", "vray_roundedges", "vray_user_attributes", "vray_objectID", "vray_fogFadeOut", "vray_localrayserver"],
+    "xgmSubdPatch":         ["vray_subdivision", "vray_subquality", "vray_displacement", "vray_opensubdiv", "vray_user_attributes", "vray_objectID", "vray_localrayserver"],
+    "kSubdiv":              ["vray_subquality", "vray_displacement", "vray_objectID", "vray_user_attributes"],
+    "kParticle":            ["vray_particle_export_attributes", "vray_sprite_orient", "vray_point_size"],
+    "kNParticle":           ["vray_particle_export_attributes", "vray_sprite_orient", "vray_point_size", "vray_particle_cache", "vray_instancer_overrides"],
+    "kSpotLight":           ["vray_pointLight"],
+    "kAreaLight":           ["vray_arealight"],
+    "kPointLight":          ["vray_pointLight"],
+    "kDirectionalLight":    ["vray_directlight"],
+    "kAmbientLight":        ["vray_light"],
+    "kNurbsSurface":        ["vray_nusrbsStaticGeom", "vray_objectID", "vray_user_attributes"],
+    "kBlinn":               ["vray_materialsGlossiness", "vray_material_id", "vray_specific_mtl"],
+    "kPhong":               ["vray_materialsGlossiness", "vray_material_id", "vray_specific_mtl"],
+    "kPhongExplorer":       ["vray_materialsGlossiness", "vray_material_id", "vray_specific_mtl"],
+    "kLambert":             ["vray_material_id", "vray_lpe_label", "vray_specific_mtl"],
+    "kAnisotropy":          ["vray_material_id", "vray_lpe_label", "vray_specific_mtl"],
+    "kRampShader":          ["vray_material_id", "vray_lpe_label", "vray_specific_mtl"],
+    "kSurfaceShader":       ["vray_material_id", "vray_lpe_label", "vray_specific_mtl"],
+    "kAssembly":            ["vray_scene_assembly"],
+    "VRayMtl":              ["vray_material_id", "vray_lpe_label", "vray_specific_mtl", "vray_closed_volume", "vray_roundedges"],
+    "VRayToonMtl":          ["vray_material_id", "vray_lpe_label", "vray_specific_mtl", "vray_closed_volume"],
+    "VRayMtl2Sided":        ["vray_material_id", "vray_specific_mtl"],
+    "VRayLightMtl":         ["vray_material_id", "vray_lpe_label", "vray_specific_mtl"],
+    "VRayFastSSS2":         ["vray_material_id", "vray_lpe_label", "vray_specific_mtl"],
+    "VRaySkinMtl":          ["vray_material_id", "vray_specific_mtl"],
+    "VRayBlendMtl":         ["vray_material_id", "vray_specific_mtl", "vray_roundedges"],
+    "VRaySimbiont":         ["vray_material_id", "vray_lpe_label", "vray_specific_mtl"],
+    "VRayBumpMtl":          ["vray_material_id", "vray_specific_mtl"],
+    "VRayCarPaintMtl":      ["vray_material_id", "vray_lpe_label", "vray_specific_mtl"],
+    "VRayCarPaint2Mtl":     ["vray_material_id", "vray_lpe_label", "vray_specific_mtl"],
+    "VRayFlakesMtl":        ["vray_material_id", "vray_lpe_label", "vray_specific_mtl"],
+    "VRayMtlWrapper":       ["vray_material_id"],
+    "VRayMtlRenderStats":   ["vray_material_id"],
+    "VRayMeshMaterial":     ["vray_material_id", "vray_specific_mtl"],
+    "VRayPluginNodeMtl":    ["vray_material_id", "vray_specific_mtl"],
+    "VRayMtlGLSL":          ["vray_material_id", "vray_lpe_label", "vray_specific_mtl"],
+    "VRayMtlHair2":         ["vray_material_id", "vray_lpe_label", "vray_specific_mtl"],
+    "VRayMtlHair3":         ["vray_material_id", "vray_lpe_label", "vray_specific_mtl"],
+    "VRayHairNextMtl":      ["vray_material_id", "vray_lpe_label", "vray_specific_mtl"],
+    "VRayVismatMtl":        ["vray_material_id", "vray_specific_mtl"],
+    "VRayAlSurface":        ["vray_material_id", "vray_lpe_label", "vray_specific_mtl", "vray_roundedges"],
+    "VRayScannedMtl":       ["vray_material_id", "vray_lpe_label", "vray_specific_mtl"],
+    "bifrostLiquidMaterial":["vray_bifrost_mtl", "vray_material_id", "vray_specific_mtl"],
+    "bifrostShape":         ["vray_bifrost_shape", "vray_fluid_shading_quality", "vray_fluid_legacy_phoenix_fd_shading"],
+    "kCamera":              ["vray_cameraPhysical", "vray_cameraOverrides", "vray_cameraDome", "vray_cameraStereoscopic"],
+    "kStereoCameraMaster":  ["vray_cameraPhysical", "vray_cameraOverrides", "vray_cameraDome", "vray_cameraStereoscopic"],
+    "kShadingEngine":       ["vray_specific_mtl", "vray_material_id", "vray_roundedges"],
+    "kTransform":           ["vray_skip_export", "vray_objectID", "vray_user_attributes"],
+    "kLodGroup":            ["vray_skip_export", "vray_objectID"],
+    "VRayDisplacement":     ["vray_subdivision", "vray_displacement", "vray_opensubdiv", "vray_subquality", "vray_localrayserver"],
+    "VRayPtex":             ["vray_file_gamma", "vray_file_ifl"],
+    "kFileTexture":         ["vray_file_gamma", "vray_file_allow_neg_colors", "vray_file_ifl", "vray_texture_filter", "vray_texture_filter_blur", "vray_ignore_data_window", "vray_use_maya_alpha_detection"],
+    "substance":            ["vray_file_gamma", "vray_file_allow_neg_colors", "vray_texture_filter", "vray_texture_format"],
+    "kImagePlane":          ["vray_file_gamma", "vray_file_allow_neg_colors", "vray_texture_filter"],
+    "kFluid":               ["vray_fluid_shading_quality", "vray_fluid_legacy_phoenix_fd_shading"],
+    "kNurbsCurve":          ["vray_nurbscurve_renderable"],
+    "kSamplerInfo":         ["vray_samplerinfo_extra_tex", "vray_2d_placement_options"],
+    "VRayLightRect":        ["vray_objectID"],
+    "VRayLightSphere":      ["vray_objectID"],
+    "VRayLightDome":        ["vray_objectID"],
+    "kProjection":          ["vray_projection_options"],
+    "kPlace2dTexture":      ["vray_2d_placement_options"],
+    "kPlace3dTexture":      ["vray_3d_placement_options", "vray_motion_blur_samples"],
+    "kHairSystem":          ["vray_hair_shader", "vray_hair_geom"],
+    "xgmSplineDescription": ["vray_hair_geom"],
+    "HairShape":            ["vray_hair_geom"],
+    "kSurfaceLuminance":    ["vray_surface_luminance"],
+    "gpuCache":             ["vray_subdivision", "vray_subquality", "vray_displacement", "vray_roundedges", "vray_user_attributes", "vray_objectID", "vray_fogFadeOut"],
+    "VRayVolumeGrid":       ["vray_pointLight"],
+    "VRayMetaball":         ["vray_objectID"],
+    "rfrk_particler4":      ["vray_rfrk_particler"],
+    "rfrk_particler5":      ["vray_rfrk_particler"],
+    "partioVisualizer":     ["vray_partio"],
+    "partioInstancer":      ["vray_partio"],
+    "kLeather":             ["vray_legacy_look"],
+    "kCloth":               ["vray_legacy_look"],
+    "VRayProxy":            ["vray_subdivision", "vray_subquality", "vray_displacement", "vray_roundedges", "vray_user_attributes", "vray_objectID", "vray_fogFadeOut", "vray_localrayserver"],
+    "VRayStochasticFlakesMtl": ["vray_material_id", "vray_lpe_label", "vray_specific_mtl"],
+    "VRayFlakes2Mtl":       ["vray_material_id", "vray_lpe_label", "vray_specific_mtl"],
+}
+
+# Build reverse lookup:  vray_group_name -> (display_name, check_attr)
+_GROUP_TO_DISPLAY = {}
+for display_name, (group_name, check_attr) in _VRAY_ATTRS.items():
+    _GROUP_TO_DISPLAY[group_name] = (display_name, check_attr)
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+def _get_maya_main_window():
+    """Return the Maya main window as a QWidget."""
+    ptr = omui.MQtUtil.mainWindow()
+    if ptr is not None:
+        return wrapInstance(int(ptr), QtWidgets.QWidget)
+    return None
+
+
+def _get_api_type_str(node_name):
+    """Return the API type string for *node_name* using Maya API 2.0."""
+    sel = om2.MSelectionList()
+    try:
+        sel.add(node_name)
+    except RuntimeError:
+        return None
+    obj = sel.getDependNode(0)
+    api_str = obj.apiTypeStr
+    if api_str.startswith("kPlugin"):
+        return cmds.nodeType(node_name)
+    return api_str
+
+
+def _attr_exists(node, check_attr):
+    """Return True if *check_attr* exists on *node*."""
+    return cmds.attributeQuery(check_attr, node=node, exists=True)
+
+
+def _apply_attr(node, group_name, state):
+    """Add or remove a V-Ray attribute group on *node*."""
+    cmds.vray("addAttributesFromGroup", node, group_name, 1 if state else 0)
+
+
+# ---------------------------------------------------------------------------
+# Stylesheet
+# ---------------------------------------------------------------------------
+
+_STYLESHEET = """
+QWidget#VRayAttrManager {
+    background-color: #2b2b2b;
+    font-family: "Segoe UI", "San Francisco", "Helvetica Neue", sans-serif;
+    color: #d4d4d4;
+}
+
+/* Header bar */
+QFrame#headerFrame {
+    background-color: #1e1e1e;
+    border-bottom: 1px solid #3a3a3a;
+    padding: 8px 12px;
+}
+QLabel#titleLabel {
+    font-weight: 600;
+    color: #e8e8e8;
+    letter-spacing: 0.5px;
+}
+QLabel#subtitleLabel {
+    color: #888888;
+}
+
+/* Mode toggle */
+QFrame#modeFrame {
+    background-color: #252525;
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    padding: 2px;
+}
+QPushButton.modeButton {
+    background-color: transparent;
+    border: none;
+    border-radius: 3px;
+    padding: 6px 16px;
+    color: #999999;
+    font-weight: 500;
+}
+QPushButton.modeButton:hover {
+    color: #cccccc;
+    background-color: #333333;
+}
+QPushButton.modeButton[active="true"] {
+    background-color: #2857af;
+    color: #ffffff;
+}
+
+/* Info bar */
+QFrame#infoBar {
+    background-color: #191e29;
+    border: 1px solid #2857af;
+    border-radius: 4px;
+    padding: 6px 10px;
+}
+QLabel#infoLabel {
+    color: #7aa9ff;
+}
+
+/* Warning/empty bar */
+QFrame#emptyBar {
+    background-color: #2a2520;
+    border: 1px solid #5a4a30;
+    border-radius: 4px;
+    padding: 6px 10px;
+}
+QLabel#emptyLabel {
+    color: #c0a060;
+}
+
+/* Attribute rows */
+QFrame#attrRow {
+    background-color: #303030;
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    padding: 4px 8px;
+}
+QFrame#attrRow:hover {
+    background-color: #363636;
+    border-color: #4a4a4a;
+}
+QFrame#attrRowActive {
+    background-color: #1a2230;
+    border: 1px solid #2857af;
+    border-radius: 4px;
+    padding: 4px 8px;
+}
+QFrame#attrRowActive:hover {
+    background-color: #1e2636;
+    border-color: #1c6bff;
+}
+
+QLabel.attrName {
+    color: #cccccc;
+    font-weight: 400;
+}
+QLabel.attrNameActive {
+    color: #e0e0e0;
+    font-weight: 500;
+}
+QLabel.attrGroup {
+    color: #666666;
+    font-family: "Consolas", "Menlo", monospace;
+}
+
+
+
+/* Batch buttons */
+QPushButton#batchBtn {
+    background-color: #353535;
+    border: 1px solid #4a4a4a;
+    border-radius: 4px;
+    padding: 5px 12px;
+    color: #bbbbbb;
+}
+QPushButton#batchBtn:hover {
+    background-color: #404040;
+    border-color: #5a5a5a;
+    color: #e0e0e0;
+}
+QPushButton#batchBtn:pressed {
+    background-color: #0d7377;
+    color: #ffffff;
+}
+
+/* Scroll area */
+QScrollArea {
+    border: none;
+    background-color: transparent;
+}
+QScrollArea > QWidget > QWidget {
+    background-color: transparent;
+}
+QScrollBar:vertical {
+    background-color: #2b2b2b;
+    width: 8px;
+    margin: 0;
+}
+QScrollBar::handle:vertical {
+    background-color: #4a4a4a;
+    border-radius: 4px;
+    min-height: 30px;
+}
+QScrollBar::handle:vertical:hover {
+    background-color: #5a5a5a;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
+
+/* Search */
+QLineEdit#searchField {
+    background-color: #252525;
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    padding: 5px 8px 5px 28px;
+    color: #d4d4d4;
+    selection-background-color: #0d7377;
+}
+QLineEdit#searchField:focus {
+    border-color: #0d7377;
+}
+
+/* Node count badge */
+QLabel#nodeBadge {
+    background-color: #0d7377;
+    color: #ffffff;
+    border-radius: 8px;
+    padding: 2px 8px;
+    font-weight: 600;
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Main widget
+# ---------------------------------------------------------------------------
+
+class VRayAttributeManager(QtWidgets.QWidget):
+    """Dockable Qt panel for managing V-Ray extra attributes."""
+
+    WINDOW_TITLE = "V-Ray Attribute Manager"
+    OBJECT_NAME = "vrayAttrManager_mainWidget"
+
+    # Selection mode enum
+    MODE_SHAPE = 0
+    MODE_TRANSFORM = 1
+
+    def __init__(self, parent=None):
+        super().__init__(parent or _get_maya_main_window())
+        self.setObjectName(self.OBJECT_NAME)
+        self.setWindowTitle(self.WINDOW_TITLE)
+        self.setWindowFlags(QtCore.Qt.Window)
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        self.setMinimumWidth(340)
+        self.setMinimumHeight(300)
+        self.resize(380, 520)
+
+        self._mode = self.MODE_SHAPE
+        self._callback_id = None
+        self._attr_toggles = []  # list of (checkbox, group_name, check_attr) for current view
+        self._search_text = ""
+
+        self._build_ui()
+        self._install_callback()
+        self._on_selection_changed()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        self.setStyleSheet(_STYLESHEET)
+        self.setProperty("id", "VRayAttrManager")
+        self.setObjectName("VRayAttrManager")
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # --- Header ---
+        header = QtWidgets.QFrame()
+        header.setObjectName("headerFrame")
+        header_lay = QtWidgets.QVBoxLayout(header)
+        header_lay.setContentsMargins(12, 10, 12, 10)
+        header_lay.setSpacing(2)
+
+        title = QtWidgets.QLabel("V-Ray Attribute Manager")
+        title.setObjectName("titleLabel")
+        header_lay.addWidget(title)
+
+        subtitle = QtWidgets.QLabel("Manage extra attributes on selected nodes")
+        subtitle.setObjectName("subtitleLabel")
+        header_lay.addWidget(subtitle)
+
+        root.addWidget(header)
+
+        # --- Toolbar area ---
+        toolbar = QtWidgets.QVBoxLayout()
+        toolbar.setContentsMargins(10, 8, 10, 4)
+        toolbar.setSpacing(6)
+
+        # Mode toggle
+        mode_frame = QtWidgets.QFrame()
+        mode_frame.setObjectName("modeFrame")
+        mode_lay = QtWidgets.QHBoxLayout(mode_frame)
+        mode_lay.setContentsMargins(2, 2, 2, 2)
+        mode_lay.setSpacing(2)
+
+        self._btn_shape = QtWidgets.QPushButton("Shape")
+        self._btn_shape.setProperty("class", "modeButton")
+        self._btn_shape.setProperty("active", True)
+        self._btn_shape.setCursor(QtCore.Qt.PointingHandCursor)
+        self._btn_shape.clicked.connect(lambda: self._set_mode(self.MODE_SHAPE))
+
+        self._btn_transform = QtWidgets.QPushButton("Transform")
+        self._btn_transform.setProperty("class", "modeButton")
+        self._btn_transform.setProperty("active", False)
+        self._btn_transform.setCursor(QtCore.Qt.PointingHandCursor)
+        self._btn_transform.clicked.connect(lambda: self._set_mode(self.MODE_TRANSFORM))
+
+        mode_lay.addWidget(self._btn_shape)
+        mode_lay.addWidget(self._btn_transform)
+        toolbar.addWidget(mode_frame)
+
+        # Search bar
+        search_row = QtWidgets.QHBoxLayout()
+        search_row.setSpacing(6)
+
+        self._search = QtWidgets.QLineEdit()
+        self._search.setObjectName("searchField")
+        self._search.setPlaceholderText("  Filter attributes...")
+        self._search.textChanged.connect(self._on_search_changed)
+        self._search.setClearButtonEnabled(True)
+        search_row.addWidget(self._search)
+
+        toolbar.addLayout(search_row)
+
+        # Info / status bar
+        self._info_frame = QtWidgets.QFrame()
+        self._info_frame.setObjectName("infoBar")
+        info_lay = QtWidgets.QHBoxLayout(self._info_frame)
+        info_lay.setContentsMargins(8, 4, 8, 4)
+        info_lay.setSpacing(6)
+        self._info_label = QtWidgets.QLabel("")
+        self._info_label.setObjectName("infoLabel")
+        info_lay.addWidget(self._info_label, 1)
+
+        self._node_badge = QtWidgets.QLabel("")
+        self._node_badge.setObjectName("nodeBadge")
+        self._node_badge.setAlignment(QtCore.Qt.AlignCenter)
+        self._node_badge.hide()
+        info_lay.addWidget(self._node_badge)
+
+        toolbar.addWidget(self._info_frame)
+
+        root.addLayout(toolbar)
+
+        # --- Scroll area for attribute rows ---
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+
+        self._scroll_content = QtWidgets.QWidget()
+        self._scroll_layout = QtWidgets.QVBoxLayout(self._scroll_content)
+        self._scroll_layout.setContentsMargins(10, 6, 10, 6)
+        self._scroll_layout.setSpacing(4)
+        self._scroll_layout.addStretch()
+
+        scroll.setWidget(self._scroll_content)
+        root.addWidget(scroll, 1)
+
+        # --- Batch action footer ---
+        footer = QtWidgets.QFrame()
+        footer.setStyleSheet("background-color: #1e1e1e; border-top: 1px solid #3a3a3a;")
+        footer_lay = QtWidgets.QHBoxLayout(footer)
+        footer_lay.setContentsMargins(10, 6, 10, 6)
+        footer_lay.setSpacing(6)
+
+        btn_all_on = QtWidgets.QPushButton("Enable All")
+        btn_all_on.setObjectName("batchBtn")
+        btn_all_on.setCursor(QtCore.Qt.PointingHandCursor)
+        btn_all_on.clicked.connect(lambda: self._batch_set(True))
+        footer_lay.addWidget(btn_all_on)
+
+        btn_all_off = QtWidgets.QPushButton("Disable All")
+        btn_all_off.setObjectName("batchBtn")
+        btn_all_off.setCursor(QtCore.Qt.PointingHandCursor)
+        btn_all_off.clicked.connect(lambda: self._batch_set(False))
+        footer_lay.addWidget(btn_all_off)
+
+        footer_lay.addStretch()
+
+        btn_refresh = QtWidgets.QPushButton("Refresh")
+        btn_refresh.setObjectName("batchBtn")
+        btn_refresh.setCursor(QtCore.Qt.PointingHandCursor)
+        btn_refresh.clicked.connect(self._on_selection_changed)
+        footer_lay.addWidget(btn_refresh)
+
+        root.addWidget(footer)
+
+    # ------------------------------------------------------------------
+    # Callback management (API 2.0 — no scriptJobs)
+    # ------------------------------------------------------------------
+
+    def _install_callback(self):
+        """Register a SelectionChanged event callback via Maya API 2.0."""
+        self._remove_callback()
+        self._callback_id = om2.MEventMessage.addEventCallback(
+            "SelectionChanged", self._selection_changed_cb
+        )
+
+    def _remove_callback(self):
+        if self._callback_id is not None:
+            try:
+                om2.MMessage.removeCallback(self._callback_id)
+            except RuntimeError:
+                pass
+            self._callback_id = None
+
+    def _selection_changed_cb(self, *_args):
+        """API callback — fires on Maya selection change."""
+        # Defer to avoid re-entrancy during selection processing
+        cmds.evalDeferred(self._on_selection_changed)
+
+    # ------------------------------------------------------------------
+    # Mode switching
+    # ------------------------------------------------------------------
+
+    def _set_mode(self, mode):
+        self._mode = mode
+        self._btn_shape.setProperty("active", mode == self.MODE_SHAPE)
+        self._btn_transform.setProperty("active", mode == self.MODE_TRANSFORM)
+        # Force style recalc
+        self._btn_shape.style().unpolish(self._btn_shape)
+        self._btn_shape.style().polish(self._btn_shape)
+        self._btn_transform.style().unpolish(self._btn_transform)
+        self._btn_transform.style().polish(self._btn_transform)
+        self._on_selection_changed()
+
+    # ------------------------------------------------------------------
+    # Core refresh logic
+    # ------------------------------------------------------------------
+
+    def _on_selection_changed(self, *_args):
+        """Rebuild the attribute list for the current selection."""
+        self._clear_attrs()
+
+        # Resolve selected nodes based on mode
+        raw_sel = cmds.ls(sl=True, long=True) or []
+        if not raw_sel:
+            self._show_empty("Nothing selected")
+            return
+
+        if self._mode == self.MODE_SHAPE:
+            nodes = cmds.ls(sl=True, dag=True, shapes=True, long=True) or []
+        else:
+            nodes = raw_sel
+
+        if not nodes:
+            short_name = raw_sel[0].rsplit("|", 1)[-1]
+            mode_label = "shape" if self._mode == self.MODE_SHAPE else "transform"
+            self._show_empty(f"No {mode_label} node for {short_name}")
+            return
+
+        # Determine API type from first node
+        api_type = _get_api_type_str(nodes[0])
+        if api_type is None:
+            self._show_empty("Could not determine node type")
+            return
+
+        relevant_groups = _VRAY_ATTRS_BY_TYPE.get(api_type, [])
+        if not relevant_groups:
+            mode_label = "shape" if self._mode == self.MODE_SHAPE else "transform"
+            self._show_empty(f"No V-Ray attributes for {api_type} ({mode_label})")
+            return
+
+        # Resolve to display entries
+        entries = []  # list of (display_name, group_name, check_attr)
+        for grp in relevant_groups:
+            info = _GROUP_TO_DISPLAY.get(grp)
+            if info:
+                entries.append((info[0], grp, info[1]))
+
+        if not entries:
+            self._show_empty(f"No recognized V-Ray attributes for {api_type}")
+            return
+
+        # Show info
+        short_name = nodes[0].rsplit("|", 1)[-1]
+        self._info_label.setText(f"{api_type}  —  {short_name}")
+        self._info_frame.setObjectName("infoBar")
+        self._info_frame.style().unpolish(self._info_frame)
+        self._info_frame.style().polish(self._info_frame)
+
+        node_count = len(nodes)
+        if node_count > 1:
+            self._node_badge.setText(f"{node_count} nodes")
+            self._node_badge.show()
+        else:
+            self._node_badge.hide()
+
+        # Build attribute rows
+        self._attr_toggles = []
+        for display_name, group_name, check_attr in entries:
+            row = self._make_attr_row(nodes, display_name, group_name, check_attr)
+            # Insert before the stretch
+            self._scroll_layout.insertWidget(self._scroll_layout.count() - 1, row)
+
+        self._apply_search_filter()
+
+    def _make_attr_row(self, nodes, display_name, group_name, check_attr):
+        """Create a single attribute row widget."""
+        is_on = _attr_exists(nodes[0], check_attr)
+
+        row = QtWidgets.QFrame()
+        row.setObjectName("attrRowActive" if is_on else "attrRow")
+        row.setProperty("display_name", display_name)
+        row_lay = QtWidgets.QHBoxLayout(row)
+        row_lay.setContentsMargins(8, 6, 8, 6)
+        row_lay.setSpacing(8)
+
+        # Text column
+        text_col = QtWidgets.QVBoxLayout()
+        text_col.setSpacing(1)
+
+        name_label = QtWidgets.QLabel(display_name)
+        name_label.setProperty("class", "attrNameActive" if is_on else "attrName")
+        text_col.addWidget(name_label)
+
+        group_label = QtWidgets.QLabel(group_name)
+        group_label.setProperty("class", "attrGroup")
+        text_col.addWidget(group_label)
+
+        row_lay.addLayout(text_col, 1)
+
+        # Toggle
+        toggle = QtWidgets.QCheckBox()
+        toggle.setObjectName("attrToggle")
+        toggle.setChecked(is_on)
+        toggle.setCursor(QtCore.Qt.PointingHandCursor)
+
+        # Connect with captured variables
+        toggle.toggled.connect(partial(self._on_toggle, nodes, group_name, check_attr, row, name_label))
+
+        row_lay.addWidget(toggle)
+
+        self._attr_toggles.append((toggle, group_name, check_attr, row))
+        return row
+
+    def _on_toggle(self, nodes, group_name, check_attr, row, name_label, state):
+        """Handle a single attribute toggle."""
+        for node in nodes:
+            try:
+                _apply_attr(node, group_name, state)
+            except Exception as e:
+                cmds.warning(f"Failed to {'add' if state else 'remove'} {group_name} on {node}: {e}")
+
+        # Update row visual
+        row.setObjectName("attrRowActive" if state else "attrRow")
+        row.style().unpolish(row)
+        row.style().polish(row)
+        name_label.setProperty("class", "attrNameActive" if state else "attrName")
+        name_label.style().unpolish(name_label)
+        name_label.style().polish(name_label)
+
+    # ------------------------------------------------------------------
+    # Batch operations
+    # ------------------------------------------------------------------
+
+    def _batch_set(self, state):
+        """Enable or disable all currently visible attribute toggles."""
+        for toggle, group_name, check_attr, row in self._attr_toggles:
+            if not row.isHidden() and toggle.isChecked() != state:
+                toggle.setChecked(state)
+
+    # ------------------------------------------------------------------
+    # Search / filter
+    # ------------------------------------------------------------------
+
+    def _on_search_changed(self, text):
+        self._search_text = text.strip().lower()
+        self._apply_search_filter()
+
+    def _apply_search_filter(self):
+        for toggle, group_name, check_attr, row in self._attr_toggles:
+            display_name = row.property("display_name") or ""
+            visible = True
+            if self._search_text:
+                visible = (
+                    self._search_text in display_name.lower()
+                    or self._search_text in group_name.lower()
+                )
+            row.setVisible(visible)
+
+    # ------------------------------------------------------------------
+    # Empty / warning states
+    # ------------------------------------------------------------------
+
+    def _show_empty(self, message):
+        self._info_label.setText(message)
+        self._info_frame.setObjectName("emptyBar")
+        self._info_frame.style().unpolish(self._info_frame)
+        self._info_frame.style().polish(self._info_frame)
+        self._info_label.setObjectName("emptyLabel")
+        self._info_label.style().unpolish(self._info_label)
+        self._info_label.style().polish(self._info_label)
+        self._node_badge.hide()
+
+    def _clear_attrs(self):
+        """Remove all attribute row widgets."""
+        self._attr_toggles = []
+        while self._scroll_layout.count() > 1:  # keep the stretch
+            item = self._scroll_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event):
+        self._remove_callback()
+        super().closeEvent(event)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+_instance = None
+
+
+def show():
+    """Show the V-Ray Attribute Manager window (singleton)."""
+    global _instance
+
+    # Close existing
+    if _instance is not None:
+        try:
+            _instance.close()
+            _instance.deleteLater()
+        except RuntimeError:
+            pass
+
+    _instance = VRayAttributeManager()
+    _instance.show()
+    _instance.raise_()
+    return _instance
+    
+show()
